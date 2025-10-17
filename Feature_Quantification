@@ -1,0 +1,1360 @@
+#Feature Quantification for WSIs using Google Colab
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+# SOURCE (Drive)
+WSI_DIR_DRIVE  = ""
+
+MASK_DIR_DRIVE = ""
+
+# LOCAL CACHE (fast SSD in Colab)
+WSI_DIR_LOCAL  = "/content/cache/wsi"
+MASK_DIR_LOCAL = "/content/cache/masks"
+
+# OUTPUTS (back to Drive)
+OUT_DIR  = ""
+
+CSV_DIR  = f"{OUT_DIR}/csv"
+QC_DIR   = f"{OUT_DIR}/qc_overlays"
+
+import os
+for d in (WSI_DIR_LOCAL, MASK_DIR_LOCAL, CSV_DIR, QC_DIR):
+    os.makedirs(d, exist_ok=True)
+
+print("WSI cache:", WSI_DIR_LOCAL)
+print("Mask cache:", MASK_DIR_LOCAL)
+print("Outputs  :", OUT_DIR)
+
+# UTC timestamp helper (replaces deprecated utcnow)
+from datetime import datetime, timezone
+def now_utc_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+!rsync -a --info=progress2 "{WSI_DIR_DRIVE}/"  "{WSI_DIR_LOCAL}/"
+!rsync -a --info=progress2 "{MASK_DIR_DRIVE}/" "{MASK_DIR_LOCAL}/"
+
+WSI_DIRS = [WSI_DIR_LOCAL]
+MASK_DIR  = MASK_DIR_LOCAL
+
+# Includes your *_idf.tif
+MASK_PATTERNS = ["*_idf.tif", "*_mask_idx.tif", "*_mask.tif", "*_result.tif", "*_pred.tif",
+                 "*.tif", "*.tiff", "*.png"]
+
+
+!pip -q install tifffile imagecodecs opencv-python-headless scikit-image pandas tqdm
+
+
+import os, glob, math, multiprocessing as mp
+import numpy as np
+import pandas as pd
+import tifffile as tiff
+import cv2
+from tqdm import tqdm
+from skimage import measure, morphology, segmentation, exposure
+from skimage.filters import sobel, gaussian
+from skimage.segmentation import morphological_geodesic_active_contour as mgac
+from skimage.util import img_as_ubyte
+
+# --- SPEED KNOBS (safe defaults) ---
+THREAD_WORKERS          = 8          # threads for per-slide processing
+PER_SLIDE_TIMEOUT_S     = 900        # timeout per future f.result()
+DECONV_DOWNSAMPLE       = 3          # downsample factor for deconvolution masks (2–4 good)
+SPEED_EDGE_DOWNSAMPLE   = 6          # downsample factor for DT/gradients in splitting (2–4)
+WSHED_MIN_DISTANCE      = 14         # seed spacing for watershed (raise to be faster/stricter)
+WSHED_CLOSE_RADIUS      = 1          # morphological closing radius (0–2)
+TOPN_PT                 = 200        # keep top-N PT instances by area (None for all)
+TOPN_DT                 = 200        # keep top-N DT instances by area (None for all)
+FEATURE_SET             = "core"     # "core" for speed, "full" for extra descriptors
+
+# Fixed class IDs (your mapping)
+PT_ID, GLOM_ID, DT_ID, VES_ID, CD_ID, BG_ID, NA_ID = 0,1,2,3,4,5,6
+
+# Fiji-like base cutoffs
+GLOM_MIN_AREA_PX = 650
+GLOM_CIRC_MIN, GLOM_CIRC_MAX = 0.400, 1.00
+GLOM_SOLID_MIN, GLOM_ECC_MAX = 0.00, 1.00
+
+PT_MIN_AREA_PX, DT_MIN_AREA_PX = 200, 200
+TUB_SOLID_MIN = 0.55
+TUB_ECC_MIN, TUB_ECC_MAX = 0.25, 0.99
+TUB_AR_MAX = 8.0
+TUB_CIRC_MIN, TUB_CIRC_MAX = 0.10, 0.95
+
+# ── Preset ──
+PRESET = "FAST"   # change to "FULL" for deeper refinement/QC on subsets
+
+if PRESET == "FAST":
+    PARALLEL_WORKERS      = 6
+    QC_EVERY_N            = 0
+    DECONV_DOWNSAMPLE     = 4
+    SPEED_EDGE_DOWNSAMPLE = 4
+    REFINE_TOP_PCT        = 0.0
+    REFINE_MAX_ITERS      = 0
+    REFINE_SIGMA          = 1.0
+    REFINE_MIN_AREA       = 2400
+    REFINE_AXIS_RATIO_MAX = 6.0
+    REFINE_SEED_MIN_DIST  = 12
+    REFINE_BRIDGE_BREAK   = 1
+elif PRESET == "FULL":
+    PARALLEL_WORKERS      = max(1, mp.cpu_count()-1)
+    QC_EVERY_N            = 5
+    DECONV_DOWNSAMPLE     = 2
+    SPEED_EDGE_DOWNSAMPLE = 2
+    REFINE_TOP_PCT        = 0.35
+    REFINE_MAX_ITERS      = 120
+    REFINE_SIGMA          = 1.0
+    REFINE_MIN_AREA       = 1200
+    REFINE_AXIS_RATIO_MAX = 8.0
+    REFINE_SEED_MIN_DIST  = 10
+    REFINE_BRIDGE_BREAK   = 1
+
+# Limit work per slide: quantify only largest N tubules per class
+PT_TOPN = 250   # set 0 to keep ALL PT
+DT_TOPN = 250   # set 0 to keep ALL DT
+
+
+# --- Instance subfeatures (classical) ---
+NUCLEI_MIN_AREA_PX   = 12       # ignore tiny specks
+NUCLEI_WATERSHED     = True     # split touching nuclei
+NUCLEI_SEED_REL_PEAK = 0.45     # seed height (0..1 of local DT max)
+
+LUMEN_PERCENTILE_PT  = 70.0     # same logic you used before
+LUMEN_PERCENTILE_DT  = 80.0
+
+
+def _worker_init():
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    try: cv2.setNumThreads(0)
+    except: pass
+
+def find_masks(mask_dir, patterns):
+    files = []
+    for pat in patterns:
+        files += glob.glob(os.path.join(mask_dir, pat))
+    return sorted(set(files))
+
+def find_wsi_for_mask(mask_path):
+    stem = os.path.splitext(os.path.basename(mask_path))[0]
+    for tag in ("_mask_idx","_mask","_result","_pred","_idf"):
+        stem = stem.replace(tag,"")
+    for d in WSI_DIRS:
+        for ext in (".tif",".tiff",".png",".jpg",".jpeg"):
+            p = os.path.join(d, stem + ext)
+            if os.path.exists(p): return p
+        g = glob.glob(os.path.join(d, stem + ".*"))
+        if g: return g[0]
+    return None
+
+def read_idx_mask(p):
+    m = tiff.imread(p)
+    if m.ndim > 2: m = m.squeeze()
+    return m.astype(np.int32, copy=False)
+
+def read_rgb_u8(p):
+    x = tiff.imread(p)
+    if x.ndim == 2: x = cv2.cvtColor(x, cv2.COLOR_GRAY2RGB)
+    elif x.ndim == 3 and x.shape[-1] > 3: x = x[..., :3]
+    if x.dtype != np.uint8:
+        x = np.clip((x.astype(np.float32)/max(float(x.max()),1.0))*255.0, 0, 255).astype(np.uint8)
+    return x
+
+def get_mpp_um(p, default_um_per_px=0.88):
+    try:
+        with tiff.TiffFile(p) as tf:
+            tags = tf.pages[0].tags
+            xres = tags.get("XResolution", None)
+            unit = tags.get("ResolutionUnit", None)
+            if xres and unit:
+                num, den = xres.value
+                res_per_unit = float(num)/float(den)
+                if unit.value == 3 and res_per_unit > 0:  # per cm
+                    px_per_cm = res_per_unit
+                    return 1e4 / px_per_cm
+    except Exception:
+        pass
+    return float(default_um_per_px)
+
+
+# Base Masson matrix and a user matrix (unchanged defaults)
+_MASSON = np.array([[0.650, 0.072, 0.268],
+                    [0.704, 0.990, 0.570],
+                    [0.286, 0.105, 0.776]], dtype=np.float32)
+
+_VEC = np.array([[0.606, 0.398, 0.808],
+                 [1.164, 1.008, 0.609],
+                 [0.757, 0.634, 0.209]], dtype=np.float32)
+
+def _deconv(img_rgb_u8, M_np):
+    M = M_np / np.linalg.norm(M_np, axis=0, keepdims=True)
+    img = np.maximum(img_rgb_u8.astype(np.float32), 1.0)
+    OD  = -np.log((img + 1.0) / 255.0)
+    Minv = np.linalg.pinv(M)
+    C = OD @ Minv
+    outs=[]
+    for k in range(3):
+        ch = C[...,k] - C[...,k].min()
+        mx = float(ch.max())
+        if mx > 0: ch = ch / mx
+        outs.append(img_as_ubyte(1.0 - ch))   # inverted 8-bit channels
+    return outs
+
+def masson_channels(img): return _deconv(img, _MASSON)
+def custom_channels(img): return _deconv(img, _VEC)
+
+# ====== Deconvolution tuning helpers (blue collagen) ======
+def _norm_cols(M):
+    M = M.astype(np.float32).copy()
+    n = np.linalg.norm(M, axis=0, keepdims=True)
+    n[n == 0] = 1.0
+    return M / n
+
+def set_masson_matrix(M_new):
+    """Globally override the Masson matrix (used by masson_channels)."""
+    global _MASSON
+    _MASSON = _norm_cols(np.asarray(M_new, dtype=np.float32))
+
+def set_collagen_vector(h, g, b):
+    """Manual tweak: set the collagen (3rd) column and keep others unchanged."""
+    M = _MASSON.copy()
+    M[:, 2] = np.array([h, g, b], dtype=np.float32)
+    set_masson_matrix(M)
+
+def nudge_collagen(*, dR=0.0, dG=0.0, dB=0.0):
+    """
+    Gentle nudge of the collagen vector.
+    - Purple/nuclei bleed → dG=+0.02, dR=-0.01
+    - Red/eosin bleed     → dR=-0.02, dG=+0.01
+    - Background/glass    → dB=-0.02 (and/or dR=+0.01)
+    """
+    h, g, b = _MASSON[:, 2]
+    set_collagen_vector(h + dR, g + dG, b + dB)
+
+def gram_schmidt_recondition(M):
+    """Recondition M to reduce cross-talk by orthogonalizing columns."""
+    U = np.zeros_like(M, dtype=np.float32)
+    for i in range(M.shape[1]):
+        v = M[:, i].astype(np.float32)
+        for j in range(i):
+            v -= (np.dot(U[:, j], v) * U[:, j])
+        n = np.linalg.norm(v)
+        U[:, i] = v / (n if n > 0 else 1.0)
+    return U
+
+def recondition_masson():
+    """Apply Gram–Schmidt to current _MASSON and set it."""
+    set_masson_matrix(gram_schmidt_recondition(_MASSON))
+
+def deconv_diagnostics(img_rgb_u8):
+    # Quick percentiles to see channel spread/leakage
+    C1, C2, C3 = masson_channels(img_rgb_u8)
+    stats = {}
+    for name, ch in zip(("C1","C2","C3"), (C1, C2, C3)):
+        p = np.percentile(ch, [1,5,25,50,75,95,99]).round(1)
+        stats[name] = dict(zip(["p1","p5","p25","p50","p75","p95","p99"], p))
+    return stats
+
+DECONV_DOWNSAMPLE = int(DECONV_DOWNSAMPLE)
+
+# --- Collagen threshold knobs (blue stain) ---
+# Which deconvolved channel to use for collagen:
+#   "C3" = Masson blue (recommended), "U3" = your custom 3rd vector
+COLLAGEN_CHANNEL   = "U3"      # "C3" or "U3"
+
+# How to choose the threshold:
+#   "fixed"       = constant threshold (fast, predictable)
+#   "yen"         = Yen automatic threshold (robust)
+#   "otsu"        = Otsu automatic threshold
+#   "percentile"  = take the given percentile of collagen intensity
+FIB_THR_MODE      = "percentile"      # "fixed" | "yen" | "otsu" | "percentile"
+
+# Parameters for the chosen mode
+FIB_FIXED_THR     = 100        # only used when FIB_THR_MODE="fixed"
+FIB_PERCENTILE    = 40       # only used when FIB_THR_MODE="percentile" (0..100)
+
+# Optional bias applied AFTER threshold is computed (signed integer, in 8-bit units)
+# Positive bias makes the mask STRICTER (fewer positives), negative makes it LOOSER.
+FIB_THR_BIAS      = -5
+
+# Compute threshold over tissue-only (recommended) or whole image
+FIB_USE_TISSUE_FOR_THR = False
+
+# Small clean-up
+FIB_MIN_OBJECT_PX = 2
+FIB_OPEN_RADIUS   = 1  # 0..2; small opening to drop speckles
+
+
+# Hematoxylin optical-density (OD) map from your Masson matrix.
+def hematoxylin_concentration(img_rgb_u8, M=None, channel=0):
+    """
+    Returns hematoxylin concentration (OD units, float32, higher = darker nuclei).
+    Uses the same Masson matrix machinery you already have.
+    """
+    import numpy as np
+    if M is None:
+        M = _MASSON
+    M = M.astype(np.float32)
+    M = M / np.linalg.norm(M, axis=0, keepdims=True)   # column-normalize
+
+    img = np.maximum(img_rgb_u8.astype(np.float32), 1.0)
+    OD  = -np.log(img / 255.0)                         # optical density
+    Minv = np.linalg.pinv(M)
+    C = OD @ Minv                                       # H, Red, Blue concentrations
+    return np.clip(C[..., channel], 0.0, None)         # channel 0 = Hematoxylin
+
+
+def compute_subcompartment_masks(img_rgb_u8):
+    """
+    Returns boolean masks (full-resolution) for:
+      - Bowman's space (bs_mask)
+      - Glomerular tuft (tuft_mask)
+      - Fibrosis (fib_mask)  <-- collagen (blue)
+    Uses downsampled deconvolution for speed, then upsamples back.
+    """
+    import numpy as np
+    from skimage import exposure
+    from skimage.filters import threshold_yen, threshold_otsu
+    from skimage import morphology
+    H, W = img_rgb_u8.shape[:2]
+
+    # Downsample for deconvolution (speed)
+    if DECONV_DOWNSAMPLE > 1:
+        small = cv2.resize(img_rgb_u8, (W // DECONV_DOWNSAMPLE, H // DECONV_DOWNSAMPLE),
+                           interpolation=cv2.INTER_LINEAR)
+    else:
+        small = img_rgb_u8
+
+    # Deconvolve (your helpers return INVERTED 8-bit channels: higher = less stain)
+    C1, C2, C3 = masson_channels(small)
+    U1, U2, U3 = custom_channels(small)
+
+    # Equalize hist a bit for stability (8-bit)
+    c3 = img_as_ubyte(exposure.equalize_hist(C3))
+    u3 = img_as_ubyte(exposure.equalize_hist(U3))
+
+    # --- Bowman's space / tuft (keep your original heuristics) ---
+    bs_small   = (c3 >= 0) & (c3 <= 122)
+    tuft_small = (c3 >= 143)
+
+    # --- Collagen (blue) selection ---
+    # Choose base channel for collagen
+    base = c3 if COLLAGEN_CHANNEL.upper() == "C3" else u3
+
+    # Convert to a "collagen intensity" where HIGHER = MORE collagen
+    # (since base is inverted: higher = less stain)
+    coll = 255 - base  # coll in [0..255], higher means stronger blue collagen
+
+    # Threshold domain (tissue or full image)
+    thr_mask = make_tissue_mask_rgb(small) if FIB_USE_TISSUE_FOR_THR else np.ones(coll.shape, dtype=bool)
+    vals = coll[thr_mask]
+
+    # Compute threshold 't'
+    if FIB_THR_MODE == "fixed":
+        t = float(FIB_FIXED_THR)
+    elif FIB_THR_MODE == "percentile":
+        # e.g., 98–99 catches the strongest ~1–2% collagen pixels
+        p = np.clip(float(FIB_PERCENTILE), 0.0, 100.0)
+        t = float(np.percentile(vals, p)) if vals.size else float(FIB_FIXED_THR)
+    elif FIB_THR_MODE == "otsu":
+        t = float(threshold_otsu(vals)) if vals.size else float(FIB_FIXED_THR)
+    else:  # "yen" (default)
+        try:
+            t = float(threshold_yen(vals)) if vals.size else float(FIB_FIXED_THR)
+        except Exception:
+            t = float(FIB_FIXED_THR)
+
+    # Apply bias (positive = stricter / fewer positives; negative = looser / more)
+    t = float(np.clip(t + float(FIB_THR_BIAS), 0.0, 255.0))
+
+    # Collagen-positive if collagen intensity exceeds threshold
+    fib_small = (coll >= t)
+
+    # Clean-up
+    if FIB_OPEN_RADIUS > 0:
+        fib_small = morphology.binary_opening(fib_small, morphology.disk(int(FIB_OPEN_RADIUS)))
+    if FIB_MIN_OBJECT_PX > 0:
+        fib_small = morphology.remove_small_objects(fib_small, min_size=int(FIB_MIN_OBJECT_PX))
+
+    # Upsample masks back to full-res
+    if DECONV_DOWNSAMPLE > 1:
+        def up(mb):
+            return cv2.resize(mb.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST).astype(bool)
+        bs_mask   = up(bs_small)
+        tuft_mask = up(tuft_small)
+        fib_mask  = up(fib_small)
+    else:
+        bs_mask, tuft_mask, fib_mask = bs_small, tuft_small, fib_small
+
+    if DEBUG:
+        try:
+            # Quick telemetry to help tuning
+            frac = 100.0 * fib_small.mean()
+            print(f"[Fibrosis] mode={FIB_THR_MODE} channel={COLLAGEN_CHANNEL} thr={t:.1f}  "
+                  f"down={DECONV_DOWNSAMPLE}  pos% (small)={frac:.2f}")
+        except Exception:
+            pass
+
+    return bs_mask, tuft_mask, fib_mask
+
+
+def make_tissue_mask(img_rgb_u8):
+    hsv = cv2.cvtColor(img_rgb_u8, cv2.COLOR_RGB2HSV)
+    H, S, V = cv2.split(hsv)
+    tissue = ((S > 75) | (V < 270))
+    tissue = morphology.binary_opening(tissue, morphology.disk(3))
+    tissue = morphology.remove_small_holes(tissue, area_threshold=4096)
+    return tissue
+
+def make_tissue_mask_rgb(img_rgb_u8, mode="adaptive", use_lab=True):
+    img = img_rgb_u8.astype(np.uint8, copy=False)
+    H, W = img.shape[:2]
+    R = img[...,0].astype(np.int16)
+    G = img[...,1].astype(np.int16)
+    B = img[...,2].astype(np.int16)
+
+    pure_white = (R > 245) & (G > 245) & (B > 245)
+    S = (R + G + B).astype(np.int32)
+    rg = np.abs(R - G)
+    yb = np.abs(((R + G) // 2) - B)
+    colorfulness = rg + yb
+
+    if mode == "fixed":
+        bright_bal = (S > 730) & (rg < 8) & (yb < 8)
+        light_grey = (S > 690) & (colorfulness < 20)
+        back_rgb = pure_white | bright_bal | light_grey
+    else:
+        p999 = np.percentile(S, 99.9) if S.size else 765
+        p995 = np.percentile(S, 99.5) if S.size else 765
+        thr_hi  = max(700, min(760, p999 - 18))
+        thr_hi2 = max(690, min(755, p995 - 24))
+        near_bal = (rg < 10) & (yb < 10)
+        very_bright = (S > thr_hi) | ((S > thr_hi2) & near_bal)
+        cf_p10 = np.percentile(colorfulness, 10.0) if colorfulness.size else 0.0
+        cf_thr = max(10.0, min(25.0, float(cf_p10) + 6.0))
+        greyish = (S > (thr_hi2 - 20)) & (colorfulness < cf_thr)
+        back_rgb = pure_white | very_bright | greyish
+
+    gray = (0.299*R + 0.587*G + 0.114*B).astype(np.float32)
+    blur = cv2.GaussianBlur(gray, (0,0), 1.2)
+    blur2= cv2.GaussianBlur(gray*gray, (0,0), 1.2)
+    local_std = np.sqrt(np.clip(blur2 - blur*blur, 0, None))
+    flat = (local_std < 1.5) & (S > 600)
+
+    back = back_rgb | flat
+
+    if use_lab:
+        lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        L = lab[...,0].astype(np.float32)
+        a = lab[...,1].astype(np.float32) - 128.0
+        b = lab[...,2].astype(np.float32) - 128.0
+        chroma = np.sqrt(a*a + b*b)
+        lab_back = (L > 200) & (chroma < 8.0)
+        back |= lab_back
+
+    tissue = ~back
+    tissue = morphology.binary_opening(tissue, morphology.disk(3))
+    tissue = morphology.remove_small_holes(tissue, area_threshold=4096)
+    tissue = morphology.remove_small_objects(tissue, min_size=4096)
+
+    border = np.zeros((H, W), dtype=bool)
+    border[:3,:] = True; border[-3:,:] = True; border[:,:3] = True; border[:,-3:] = True
+    tissue[border] = False
+
+    return tissue
+
+def fast_C3(img_rgb_u8, down=max(1, int(SPEED_EDGE_DOWNSAMPLE))):
+    H, W = img_rgb_u8.shape[:2]
+    if down > 1:
+        small = cv2.resize(img_rgb_u8, (W//down, H//down), interpolation=cv2.INTER_LINEAR)
+    else:
+        small = img_rgb_u8
+    _, _, C3_small = masson_channels(small)
+    if down > 1:
+        C3 = cv2.resize(C3_small, (W, H), interpolation=cv2.INTER_LINEAR)
+    else:
+        C3 = C3_small
+    return C3.astype(np.float32)
+
+def lumen_mask_percentile(img_rgb_u8, inst_lab: np.ndarray, class_name: str) -> pd.DataFrame:
+    if inst_lab is None or inst_lab.max() == 0:
+        return pd.DataFrame(columns=["Label","LumenArea_px"])
+
+    C3 = fast_C3(img_rgb_u8)
+    in_any = inst_lab > 0
+    if not in_any.any():
+        return pd.DataFrame(columns=["Label","LumenArea_px"])
+
+    pct = LUMEN_PERCENTILE_PT if class_name == "PT" else LUMEN_PERCENTILE_DT
+    thr = np.percentile(C3[in_any], pct)
+    lumen = (C3 >= thr) & in_any
+    lumen = morphology.binary_opening(lumen, morphology.disk(1))
+
+    max_lbl = int(inst_lab.max())
+    lumen_px = np.bincount(inst_lab.ravel(),
+                           weights=lumen.astype(np.float32).ravel(),
+                           minlength=max_lbl+1).astype(np.int64)
+    rows = [{"Label": lbl, "LumenArea_px": int(lumen_px[lbl])} for lbl in range(1, max_lbl+1)]
+    return pd.DataFrame(rows)
+
+
+def nuclei_intensity_trichrome(rgb_u8: np.ndarray) -> np.ndarray:
+    C1, C2, C3 = masson_channels(rgb_u8)  # inverted: higher = less stain
+    nuc = 255 - C1                        # higher = more nuclei stain
+    # mild stabilization; also dampen very-blue collagen edges (C3)
+    nuc = img_as_ubyte(exposure.equalize_hist(nuc))
+    col = 255 - C3
+    nuc = np.clip(nuc.astype(np.int16) - (col.astype(np.int16) // 8), 0, 255).astype(np.uint8)
+    return nuc
+
+def split_tubules_smart(img_rgb_u8, class_mask_u8, *,
+                        class_name="PT",
+                        min_area=300,
+                        bridge_break=2,
+                        lumen_pct_pt=75,
+                        lumen_pct_dt=90,
+                        peak_rel_pt=0.70,
+                        peak_rel_dt=0.75,
+                        tissue_mode="adaptive"):
+    m = class_mask_u8.astype(bool)
+    if bridge_break > 0:
+        m = morphology.binary_opening(m, morphology.disk(bridge_break))
+    tissue = make_tissue_mask_rgb(img_rgb_u8, mode=tissue_mode)
+    m &= tissue
+    m = morphology.remove_small_objects(m, min_size=min_area)
+    if not m.any():
+        return np.zeros_like(class_mask_u8, dtype=np.int32)
+
+    C3 = fast_C3(img_rgb_u8, down=SPEED_EDGE_DOWNSAMPLE)
+
+    pct = lumen_pct_pt if class_name == "PT" else lumen_pct_dt
+    thr = np.percentile(C3[m], pct) if np.any(m) else 255.0
+    lumen = (C3 >= thr) & m
+    lumen = morphology.binary_opening(lumen, morphology.disk(1))
+
+    dist = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
+    rel = peak_rel_pt if class_name == "PT" else peak_rel_dt
+    peaks = (dist > (rel * (dist.max() if dist.max() > 0 else 1.0)))
+    seeds = measure.label(lumen | peaks)
+
+    grad = sobel(gaussian(C3, sigma=1.0, preserve_range=True))
+    lab = segmentation.watershed(grad, markers=seeds, mask=m)
+    lab = morphology.remove_small_objects(lab, min_size=min_area)
+    return lab.astype(np.int32)
+
+SPEED_EDGE_DOWNSAMPLE = int(SPEED_EDGE_DOWNSAMPLE)
+def _edge_speed(img_rgb, sigma=1.0):
+    _,_,C3 = masson_channels(img_rgb)
+    base = C3.astype(np.float32)
+    ds = SPEED_EDGE_DOWNSAMPLE if SPEED_EDGE_DOWNSAMPLE>0 else 1
+    if ds > 1:
+        fx = 1.0 / ds
+        small = cv2.resize(base, (0,0), fx=fx, fy=fx, interpolation=cv2.INTER_AREA)
+        e = sobel(gaussian(small, sigma=sigma, preserve_range=True)).astype(np.float32)
+        s = 1.0 / (1.0 + e)
+        return cv2.resize(s, (base.shape[1], base.shape[0]), interpolation=cv2.INTER_LINEAR)
+    e = sobel(gaussian(base, sigma=sigma, preserve_range=True)).astype(np.float32)
+    return 1.0 / (1.0 + e)
+
+def _local_seeded_split(binary_u8, min_distance=12, bridge_break=1):
+    m = morphology.binary_opening(binary_u8.astype(bool), morphology.disk(bridge_break))
+    if not m.any():
+        return np.zeros_like(binary_u8, dtype=np.int32)
+    dist = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
+    peaks = dist > (0.45 * dist.max())
+    seeds = measure.label(peaks)
+    lab = segmentation.watershed(-dist, markers=seeds, mask=m)
+    return lab.astype(np.int32)
+
+def draw_instances_overlay(base_rgb, inst_lab, class_name, color_seed=0, alpha=0.35, thickness=2):
+    if inst_lab.max() == 0: return base_rgb.copy()
+    overlay = base_rgb.copy()
+    rng = np.random.default_rng(color_seed)
+    colors = rng.integers(50, 255, size=(int(inst_lab.max())+1, 3), dtype=np.uint8)
+    for lbl in range(1, int(inst_lab.max())+1):
+        mask = (inst_lab == lbl).astype(np.uint8)
+        if mask.sum() == 0: continue
+        color = tuple(int(c) for c in colors[lbl])
+        colored = np.zeros_like(overlay); colored[:] = color
+        alpha_map = (mask[...,None] > 0).astype(np.float32) * alpha
+        overlay = (overlay*(1.0 - alpha_map) + colored*alpha_map).astype(np.uint8)
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, cnts, -1, (0,0,0), thickness)
+    return overlay
+
+def _per_label_sum(mask_bool, labels_int32, max_label=None):
+    if max_label is None: max_label = int(labels_int32.max())
+    return np.bincount(labels_int32.ravel(), weights=mask_bool.astype(np.float32).ravel(), minlength=max_label+1)
+
+def _per_label_rgb_mean(img_rgb, labels_int32, max_label=None):
+    if max_label is None: max_label = int(labels_int32.max())
+    lab = labels_int32.ravel()
+    cnt = np.bincount(lab, minlength=max_label+1).astype(np.float64); cnt[cnt==0]=1
+    out = np.zeros((max_label+1,3), dtype=np.float64)
+    for c in range(3):
+        out[:,c] = np.bincount(lab, weights=img_rgb[...,c].ravel(), minlength=max_label+1)
+    return out / cnt[:,None]
+
+def props_table_from_labels(lab, img, cls_name, slide_stem, mpp_um, extra_masks=None):
+    if lab.max() == 0:
+        return pd.DataFrame()
+    props_df = pd.DataFrame(measure.regionprops_table(
+        lab,
+        properties=("label","area","perimeter","equivalent_diameter",
+                    "major_axis_length","minor_axis_length","eccentricity",
+                    "solidity","centroid","bbox")
+    ))
+    props_df.rename(columns={
+        "label":"Label","area":"Area_px","perimeter":"Perimeter_px",
+        "equivalent_diameter":"EquivalentDiameter_px",
+        "major_axis_length":"major_axis_length_px",
+        "minor_axis_length":"minor_axis_length_px",
+        "centroid-0":"centroid_y_px","centroid-1":"centroid_x_px",
+        "bbox-0":"bbox_y_px","bbox-1":"bbox_x_px","bbox-2":"bbox_y2_px","bbox-3":"bbox_x2_px",
+    }, inplace=True)
+    props_df["Area_µm²"]                = props_df["Area_px"] * (mpp_um**2)
+    props_df["Perimeter_µm"]            = props_df["Perimeter_px"] *  mpp_um
+    props_df["EquivalentDiameter_µm"]   = props_df["EquivalentDiameter_px"] * mpp_um
+    props_df["major_axis_length_µm"]    = props_df["major_axis_length_px"] * mpp_um
+    props_df["minor_axis_length_µm"]    = props_df["minor_axis_length_px"] * mpp_um
+    props_df["bbox_w_px"] = props_df["bbox_x2_px"] - props_df["bbox_x_px"]
+    props_df["bbox_h_px"] = props_df["bbox_y2_px"] - props_df["bbox_y_px"]
+    P = props_df["Perimeter_px"].astype(float).values
+    A = props_df["Area_px"].astype(float).values
+    props_df["circularity"] = (4*np.pi*A)/np.clip(P*P, 1.0, None)
+    max_label = int(lab.max())
+    means = _per_label_rgb_mean(img, lab, max_label)
+    props_df["mean_R"] = props_df["Label"].map(lambda i: float(means[i,0]))
+    props_df["mean_G"] = props_df["Label"].map(lambda i: float(means[i,1]))
+    props_df["mean_B"] = props_df["Label"].map(lambda i: float(means[i,2]))
+    props_df.insert(0, "Slide", slide_stem)
+    props_df.insert(1, "Class", cls_name)
+    if extra_masks:
+        for name, m in extra_masks.items():
+            if m is None: continue
+            sums = _per_label_sum(m, lab, max_label)
+            props_df[f"{name}Area_px"]  = props_df["Label"].map(lambda i: int(sums[i]))
+            props_df[f"{name}Area_µm²"] = props_df[f"{name}Area_px"] * (mpp_um**2)
+            props_df[f"{name}Fraction"] = props_df[f"{name}Area_px"] / props_df["Area_px"].clip(lower=1)
+    return props_df
+
+def _add_axis_ratio(df):
+    denom = np.clip(df.get("minor_axis_length_px", 0.0).values, 1e-6, None)
+    df["axis_ratio"] = (df.get("major_axis_length_px", 0.0).values / denom).astype(float)
+    return df
+
+def _mk_rule_counts(df, keep_mask, rules):
+    removed = (~keep_mask)
+    out = {"total": int(len(df)), "kept": int(keep_mask.sum()), "removed": int(removed.sum())}
+    for name, fail in rules.items():
+        out[f"removed_by_{name}"] = int((removed & fail).sum())
+    return out
+
+def glom_filter(df):
+    if df is None or df.empty:
+        return df, {"total":0,"kept":0,"removed":0}
+    P = df.get("Perimeter_px", 0.0).astype(float).values
+    A = df.get("Area_px", 0.0).astype(float).values
+    circ = (4*np.pi*A)/np.clip(P*P, 1.0, None)
+    fail = {
+        "area": (df["Area_px"] < GLOM_MIN_AREA_PX),
+        "circ_min": (circ < GLOM_CIRC_MIN),
+        "circ_max": (circ > GLOM_CIRC_MAX),
+    }
+    if "solidity" in df and GLOM_SOLID_MIN>0:     fail["solidity"]    = (df["solidity"] < GLOM_SOLID_MIN)
+    if "eccentricity" in df and GLOM_ECC_MAX<1.0: fail["eccentricity"] = (df["eccentricity"] > GLOM_ECC_MAX)
+    keep = ~np.logical_or.reduce(tuple(fail.values())) if fail else np.ones(len(df), dtype=bool)
+    counts = _mk_rule_counts(df, keep, fail)
+    return df.loc[keep].reset_index(drop=True), counts
+
+def tubule_filter(df, class_name):
+    if df is None or df.empty:
+        return df, {"total":0,"kept":0,"removed":0}
+    min_area = PT_MIN_AREA_PX if class_name=="PT" else DT_MIN_AREA_PX
+    df = _add_axis_ratio(df)
+    if "circularity" not in df:
+        P = df.get("Perimeter_px", 0.0).astype(float).values
+        A = df.get("Area_px", 0.0).astype(float).values
+        df["circularity"] = (4*np.pi*A)/np.clip(P*P, 1.0, None)
+    fail = {
+        "area":       (df["Area_px"] < min_area),
+        "solidity":   (df.get("solidity", 1.0) < TUB_SOLID_MIN),
+        "ecc_low":    (df.get("eccentricity", 0.0) < TUB_ECC_MIN),
+        "ecc_high":   (df.get("eccentricity", 1.0) > TUB_ECC_MAX),
+        "axis_ratio": (df.get("axis_ratio", 1.0) > TUB_AR_MAX),
+        "circ_min":   (df["circularity"] < TUB_CIRC_MIN),
+        "circ_max":   (df["circularity"] > TUB_CIRC_MAX),
+    }
+    keep = ~np.logical_or.reduce(tuple(fail.values()))
+    counts = _mk_rule_counts(df, keep, fail)
+    return df.loc[keep].reset_index(drop=True), counts
+
+def keep_top_n_labels(lab_int32: np.ndarray, topn: int) -> np.ndarray:
+    if topn is None or topn <= 0:
+        return measure.label(lab_int32 > 0).astype(np.int32)
+    max_label = int(lab_int32.max())
+    if max_label <= 1:
+        return lab_int32.astype(np.int32)
+    areas = np.bincount(lab_int32.ravel(), minlength=max_label+1)
+    cand = [(lbl, int(areas[lbl])) for lbl in range(1, max_label+1) if areas[lbl] > 0]
+    if not cand:
+        return np.zeros_like(lab_int32, dtype=np.int32)
+    cand.sort(key=lambda x: -x[1])
+    out = np.zeros_like(lab_int32, dtype=np.int32)
+    new_id = 0
+    for lbl,_ in cand[:topn]:
+        new_id += 1
+        out[lab_int32 == lbl] = new_id
+    return out
+
+from skimage.filters import threshold_yen, threshold_otsu
+
+def _threshold_nuclei_in_mask(nuc_img: np.ndarray, inst_mask: np.ndarray) -> np.ndarray:
+    vals = nuc_img[inst_mask]
+    if vals.size == 0:
+        return np.zeros_like(inst_mask, dtype=bool)
+    try:
+        t = threshold_yen(vals)
+    except Exception:
+        t = threshold_otsu(vals)
+    m = (nuc_img >= t) & inst_mask
+    m = morphology.remove_small_objects(m, min_size=int(NUCLEI_MIN_AREA_PX))
+    m = morphology.binary_opening(m, morphology.disk(1))
+    return m
+
+def _split_touching_with_ws(binary_mask: np.ndarray) -> np.ndarray:
+    if not binary_mask.any():
+        return np.zeros_like(binary_mask, dtype=np.int32)
+    dist = cv2.distanceTransform(binary_mask.astype(np.uint8), cv2.DIST_L2, 3)
+    mx = float(dist.max()) if dist.size else 0.0
+    peaks = dist > (NUCLEI_SEED_REL_PEAK * (mx if mx > 0 else 1.0))
+    seeds = measure.label(peaks & binary_mask)
+    lab = segmentation.watershed(-dist, markers=seeds, mask=binary_mask)
+    lab = morphology.remove_small_objects(lab, min_size=int(NUCLEI_MIN_AREA_PX)).astype(np.int32)
+    return lab
+
+def detect_nuclei_trichrome_classic(crop_rgb: np.ndarray, inst_crop_mask: np.ndarray) -> np.ndarray:
+    nuc = nuclei_intensity_trichrome(crop_rgb)
+    base = _threshold_nuclei_in_mask(nuc, inst_crop_mask)
+    if not NUCLEI_WATERSHED:
+        lab = measure.label(base).astype(np.int32)
+        return morphology.remove_small_objects(lab, min_size=int(NUCLEI_MIN_AREA_PX)).astype(np.int32)
+    return _split_touching_with_ws(base)
+
+
+def _bbox_from_label_fast(labels: np.ndarray):
+    ys, xs = np.where(labels > 0)
+    if ys.size == 0: return {}
+    lbls = labels[ys, xs]
+    out = {}
+    for lbl in np.unique(lbls):
+        m = (lbls == lbl); y = ys[m]; x = xs[m]
+        out[int(lbl)] = (int(y.min()), int(x.min()), int(y.max())+1, int(x.max())+1)
+    return out
+
+def _crop_bbox(img, y1, x1, y2, x2, pad=0):
+    H, W = img.shape[:2]
+    y1p = max(0, y1 - pad); x1p = max(0, x1 - pad)
+    y2p = min(H, y2 + pad); x2p = min(W, x2 + pad)
+    return img[y1p:y2p, x1p:x2p], (y1p, x1p, y2p, x2p)
+
+def nuclei_props_for_instances(img_rgb: np.ndarray, inst_lab: np.ndarray) -> pd.DataFrame:
+    if inst_lab is None or inst_lab.max() == 0:
+        return pd.DataFrame(columns=["Label", "Nuclei_Count", "NucleiArea_px"])
+    rows = []
+    for lbl, (y1,x1,y2,x2) in _bbox_from_label_fast(inst_lab).items():
+        if lbl <= 0: continue
+        crop_rgb, (cy1,cx1,cy2,cx2) = _crop_bbox(img_rgb, y1, x1, y2, x2, pad=12)
+        inst_crop_mask = (inst_lab[cy1:cy2, cx1:cx2] == lbl)
+        nlab = detect_nuclei_trichrome_classic(crop_rgb, inst_crop_mask)
+        if nlab.max() > 0:
+            cnt = int(nlab.max())
+            area_px = int((nlab > 0).sum())
+        else:
+            cnt = 0; area_px = 0
+        rows.append({"Label": lbl, "Nuclei_Count": cnt, "NucleiArea_px": area_px})
+    return pd.DataFrame(rows)
+
+def attach_cell_lumen_nuclei_features(df: pd.DataFrame,
+                                      inst_lab: np.ndarray,
+                                      img_rgb_u8: np.ndarray,
+                                      mpp_um: float,
+                                      class_name: str) -> pd.DataFrame:
+    if df is None or df.empty or inst_lab is None or inst_lab.max() == 0:
+        return df
+
+    # Lumen
+    lum = lumen_mask_percentile(img_rgb_u8, inst_lab, class_name)
+    df = df.merge(lum, how="left", on="Label")
+    df["LumenArea_px"]   = df["LumenArea_px"].fillna(0).astype(int)
+    df["LumenArea_µm²"]  = df["LumenArea_px"] * (mpp_um**2)
+
+    # Cell area (instance minus lumen)
+    df["CellArea_px"]    = (df["Area_px"] - df["LumenArea_px"]).clip(lower=0).astype(int)
+    df["CellArea_µm²"]   = df["CellArea_px"] * (mpp_um**2)
+
+    # Nuclei (inside each instance footprint)
+    ndf = nuclei_props_for_instances(img_rgb_u8, inst_lab)
+    df = df.merge(ndf, how="left", on="Label")
+    df["Nuclei_Count"]   = df["Nuclei_Count"].fillna(0).astype(int)
+    df["NucleiArea_px"]  = df["NucleiArea_px"].fillna(0).astype(int)
+    df["NucleiArea_µm²"] = df["NucleiArea_px"] * (mpp_um**2)
+
+    # Density normalized by cell area (not total instance)
+    df["Nuclei_Density_per_1000µm²"] = (
+        1000.0 * df["Nuclei_Count"] / df["CellArea_µm²"].clip(lower=1e-6)
+    ).astype(float)
+
+    return df
+
+
+from datetime import datetime, timezone
+import time
+from pathlib import Path
+
+DEBUG = False
+PER_SLIDE_TIMEOUT_S = 900  # 15 minutes per slide
+DBG_DIR = os.path.join(QC_DIR, "_debug")
+os.makedirs(DBG_DIR, exist_ok=True)
+
+def hb(slide, stage, event):
+    if not DEBUG: return
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    p = Path(DBG_DIR) / f"{slide}.{stage}.{event}.txt"
+    try: p.write_text(ts)
+    except Exception: pass
+
+class StageTimer:
+    def __init__(self): self.t0 = time.perf_counter(); self.t = {}
+    def tic(self, name): self.t[name] = {"start": time.perf_counter()}
+    def toc(self, name):
+        self.t[name]["end"] = time.perf_counter()
+        self.t[name]["sec"] = self.t[name]["end"] - self.t[name]["start"]
+    def as_rows(self, slide):
+        rows = []
+        tot = time.perf_counter() - self.t0
+        for k,v in self.t.items():
+            rows.append({"Slide": slide, "Stage": k, "Seconds": round(v.get("sec", 0.0), 3)})
+        rows.append({"Slide": slide, "Stage": "__TOTAL__", "Seconds": round(tot, 3)})
+        return rows
+
+def summary_row(cnts, cls, slide_stem):
+    if cnts is None: return None
+    base = {"Slide": slide_stem, "Class": cls,
+            "Total": cnts.get("total",0), "Kept": cnts.get("kept",0), "Removed": cnts.get("removed",0)}
+    for k,v in cnts.items():
+        if k.startswith("removed_by_"): base[k] = v
+    return pd.DataFrame([base])
+
+
+
+# ---- QC: ultra-light random sampling for visual checks ----
+QC_OVERLAY = False
+QC_CROPS   = True
+QC_SAMPLE_N_PER_CLASS = 5
+CROP_PAD_PX = 24
+
+# Fiji-style Masson matrices (columns = stain OD vectors, H | Red | Blue(FG))
+# Default is H, Acid Fuchsin, Aniline Blue (H_A_A). Switch to H_A_FG if your lab uses Fast Green.
+TRICHROME_VARIANT = "H_A_FG"   # "H_A_A" or "H_A_FG"
+
+# Nuclei (QC-only) classical params
+NUCLEI_MIN_AREA_PX   = 12       # ignore tiny specks
+NUCLEI_WATERSHED     = True     # split touching nuclei
+NUCLEI_SEED_REL_PEAK = 0.45     # seed height (0..1 of local DT max)
+NUCLEI_THR_MODE      = "otsu"  # "sauvola" | "otsu"
+NUC_SAUVOLA_WIN      = 31         # odd int; ~ 15–31 good
+NUC_SAUVOLA_K        = 0.2        # 0.15–0.30 typical
+
+QC_CROP_DIR = os.path.join(QC_DIR, "crops")
+os.makedirs(QC_CROP_DIR, exist_ok=True)
+
+# ---------------- Fiji-like colour deconvolution ----------------
+def _norm_cols(M):
+    n = np.linalg.norm(M, axis=0, keepdims=True)
+    n[n == 0] = 1.0
+    return M / n
+
+# Ruifrok & Johnston matrices approximating Fiji’s “Masson Trichrome”
+_M_H_A_A  = _norm_cols(np.array([
+    [0.650, 0.704, 0.286],   # Hematoxylin, Acid Fuchsin (red), Aniline Blue
+    [0.072, 0.990, 0.105],
+    [0.268, 0.570, 0.776],
+], dtype=np.float32))
+
+_M_H_A_FG = _norm_cols(np.array([
+    [0.650, 0.704, 0.063],   # Hematoxylin, Acid Fuchsin (red), Fast Green
+    [0.072, 0.990, 0.954],
+    [0.268, 0.570, 0.292],
+], dtype=np.float32))
+
+def _hematoxylin_od(rgb_u8: np.ndarray) -> np.ndarray:
+    """Return hematoxylin optical density (float32, >=0). Higher = darker nuclei.
+       Matches the channel Fiji shows as 'black/white' nuclei (not inverted)."""
+    M = _M_H_A_A if TRICHROME_VARIANT == "H_A_A" else _M_H_A_FG
+    img = np.maximum(rgb_u8.astype(np.float32), 1.0) / 255.0
+    OD  = -np.log(img)
+    Minv = np.linalg.pinv(M)        # pseudoinverse like Fiji
+    C   = OD @ Minv                 # concentrations/OD per stain
+    H   = C[..., 0]
+    H[~np.isfinite(H)] = 0.0
+    H = np.clip(H, 0.0, None).astype(np.float32)
+    return H
+
+# ---------------- nuclei from hematoxylin OD (QC crops) ----------------
+def _nuclei_mask_from_crop(crop_rgb: np.ndarray, inst_mask_crop: np.ndarray) -> np.ndarray:
+    he = _hematoxylin_od(crop_rgb)    # float32, higher = more hematoxylin
+    # Local thresholding (Sauvola) or global (Otsu) on H-OD
+    if NUCLEI_THR_MODE.lower() == "sauvola":
+        from skimage.filters import threshold_sauvola
+        win = max(3, int(NUC_SAUVOLA_WIN) | 1)  # force odd
+        T = threshold_sauvola(he, window_size=win, k=float(NUC_SAUVOLA_K))
+        m = he > T
+    else:
+        from skimage.filters import threshold_otsu
+        T = threshold_otsu(he[inst_mask_crop]) if inst_mask_crop.any() else threshold_otsu(he)
+        m = he > T
+
+    # restrict to the instance footprint & clean
+    m &= inst_mask_crop
+    if NUCLEI_MIN_AREA_PX > 0:
+        m = morphology.remove_small_objects(m, min_size=int(NUCLEI_MIN_AREA_PX))
+    if not m.any():
+        return np.zeros_like(inst_mask_crop, dtype=np.int32)
+
+    # optional watershed split to separate touchers
+    if NUCLEI_WATERSHED:
+        from scipy import ndimage as ndi
+        dist = ndi.distance_transform_edt(m)
+        # seeds: peaks above a relative fraction of local max
+        rel = float(NUCLEI_SEED_REL_PEAK)
+        peaks = dist > (rel * (dist.max() if dist.max() > 0 else 1.0))
+        seeds = measure.label(peaks)
+        lab = segmentation.watershed(-dist, markers=seeds, mask=m)
+    else:
+        lab = measure.label(m)
+    return lab.astype(np.int32, copy=False)
+
+def _bbox_from_label(lab, lbl):
+    ys, xs = np.where(lab == lbl)
+    if ys.size == 0: return None
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    return y1, x1, y2, x2
+
+def _crop_with_pad(img, y1, x1, y2, x2, pad=0):
+    H, W = img.shape[:2]
+    y1p = max(0, y1 - pad); x1p = max(0, x1 - pad)
+    y2p = min(H, y2 + pad); x2p = min(W, x2 + pad)
+    return img[y1p:y2p, x1p:x2p], (y1p, x1p, y2p, x2p)
+
+def _sample_labels(lab: np.ndarray, sample_n: int, seed: int):
+    max_lbl = int(lab.max())
+    if max_lbl <= 0 or sample_n <= 0:
+        return []
+    areas = np.bincount(lab.ravel(), minlength=max_lbl+1)
+    valid = [lbl for lbl in range(1, max_lbl+1) if areas[lbl] > 0]
+    if not valid:
+        return []
+    rng = np.random.default_rng(seed)
+    if len(valid) <= sample_n:
+        return valid
+    return list(rng.choice(valid, size=sample_n, replace=False))
+
+def _save_random_crops(slide_stem, img, lab, out_dir, class_name,
+                       sample_n=3, pad=CROP_PAD_PX, seed_base=0):
+    if lab is None or lab.max() == 0 or sample_n <= 0:
+        return 0
+    os.makedirs(out_dir, exist_ok=True)
+    seed = (hash((slide_stem, class_name, seed_base)) & 0xFFFFFFFF)
+    labels = _sample_labels(lab, sample_n, seed=seed)
+    saved = 0
+    for lbl in labels:
+        bb = _bbox_from_label(lab, lbl)
+        if bb is None:
+            continue
+        y1, x1, y2, x2 = bb
+        crop, (cy1, cx1, cy2, cx2) = _crop_with_pad(img, y1, x1, y2, x2, pad=pad)
+        inst_mask_crop = (lab[cy1:cy2, cx1:cx2] == lbl)
+
+        # ---- nuclei (hematoxylin OD → threshold/split) ----
+        nlab = _nuclei_mask_from_crop(crop, inst_mask_crop)
+        nuc_count = int(nlab.max())
+
+        # draw instance contour (white/black) as before
+        vis = crop.copy()
+        inst_u8 = inst_mask_crop.astype(np.uint8)
+        cnts, _ = cv2.findContours(inst_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(vis, cnts, -1, (0, 0, 0), 2)
+        cv2.drawContours(vis, cnts, -1, (255, 255, 255), 1)
+
+        # draw nuclei contours in yellow
+        if nuc_count > 0:
+            for n in range(1, nuc_count+1):
+                m = (nlab == n).astype(np.uint8)
+                if m.sum() == 0: continue
+                cts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(vis, cts, -1, (255, 255, 0), 1)
+
+        # label text
+        cv2.putText(vis, f"nuclei={nuc_count}", (6, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
+        cv2.putText(vis, f"nuclei={nuc_count}", (6, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+
+        fn = f"{slide_stem}_{class_name}_L{lbl:05d}.png"
+        cv2.imwrite(os.path.join(out_dir, fn), vis[..., ::-1])
+        saved += 1
+    return saved
+
+def save_qc_visuals(slide_stem, img, glom_lab, pt_lab, dt_lab):
+    if QC_OVERLAY:
+        ov = draw_instances_overlay(img, glom_lab, "Glom", color_seed=123, alpha=0.30)
+        ov = draw_instances_overlay(ov,  pt_lab,   "PT",   color_seed=321, alpha=0.25)
+        ov = draw_instances_overlay(ov,  dt_lab,   "DT",   color_seed=999, alpha=0.30)
+        cv2.imwrite(os.path.join(QC_DIR, f"{slide_stem}_overlay.png"), ov[..., ::-1])
+    if QC_CROPS:
+        base_dir = os.path.join(QC_CROP_DIR, slide_stem)
+        g_dir = os.path.join(base_dir, "Glom")
+        p_dir = os.path.join(base_dir, "PT")
+        d_dir = os.path.join(base_dir, "DT")
+        g_saved = _save_random_crops(slide_stem, img, glom_lab, g_dir, "Glom", sample_n=0, pad=CROP_PAD_PX, seed_base=1)
+        p_saved = _save_random_crops(slide_stem, img, pt_lab,   p_dir, "PT",   sample_n=QC_SAMPLE_N_PER_CLASS, pad=CROP_PAD_PX, seed_base=2)
+        d_saved = _save_random_crops(slide_stem, img, dt_lab,   d_dir, "DT",   sample_n=QC_SAMPLE_N_PER_CLASS, pad=CROP_PAD_PX, seed_base=3)
+        return {"glom_crops": g_saved, "pt_crops": p_saved, "dt_crops": d_saved}
+    return {}
+
+
+# --- Diagnostics: collagen channel statistics (place before process_slide) ---
+def collagen_stats(img_rgb_u8, glom_lab=None):
+    from scipy.stats import spearmanr
+    import numpy as np
+
+    # Deconvolved channels (your masson_channels returns inverted 8-bit: lower = more stain)
+    C1, C2, C3 = masson_channels(img_rgb_u8)
+
+    # Tissue mask using your robust RGB method
+    tissue = make_tissue_mask_rgb(img_rgb_u8)
+
+    def pct(ch, m):
+        vals = ch[m].astype(np.uint8)
+        if vals.size == 0: return {}
+        ps = np.percentile(vals, [1,5,25,50,75,95,99]).round(1)
+        p = dict(zip(["p1","p5","p25","p50","p75","p95","p99"], ps))
+        p["low_tail_<60_pct"] = round(100.0 * (vals < 60).mean(), 2)
+        p["spread_p95_minus_p5"] = float(p["p95"] - p["p5"])
+        return p
+
+    out = {"C1_tissue": pct(C1, tissue),
+           "C2_tissue": pct(C2, tissue),
+           "C3_tissue": pct(C3, tissue)}
+
+    # cross-talk over tissue
+    vals = lambda ch: ch[tissue].astype(np.float32)
+    if vals(C1).size and vals(C3).size:
+        out["spearman_C1_vs_C3_tissue"] = float(spearmanr(vals(C1), vals(C3)).correlation)
+
+    # Glomerulus-only (optional)
+    if glom_lab is not None and glom_lab.max() > 0:
+        glom_mask = glom_lab > 0
+        mask = tissue & glom_mask
+        out["C3_glom"] = pct(C3, mask)
+        if C1[mask].size and C3[mask].size:
+            out["spearman_C1_vs_C3_glom"] = float(
+                spearmanr(C1[mask].ravel().astype(np.float32),
+                          C3[mask].ravel().astype(np.float32)).correlation
+            )
+    return out
+
+
+# --- Blue-only reconstruction (keep collagen OD, zero nuclei/eosin OD) ---
+
+def blue_only_rgb_from_deconv(img_rgb_u8, M=None, channel=2, I0=255.0):
+    """
+    Recompose an RGB image that contains ONLY the selected stain (default: collagen, column 2).
+    All other stains are set to zero OD (i.e., white). This is physically consistent and
+    better than zeroing R/G in raw RGB.
+    """
+    import numpy as np
+
+    if M is None:
+        M = _MASSON
+    # Normalize columns of the stain matrix
+    M = M.astype(np.float32)
+    M = M / np.linalg.norm(M, axis=0, keepdims=True)
+
+    # Convert to optical density (OD)
+    img = np.maximum(img_rgb_u8.astype(np.float32), 1.0)
+    OD  = -np.log(img / float(I0))
+
+    # Deconvolve to concentrations
+    Minv = np.linalg.pinv(M)
+    C = OD @ Minv                    # HxWx3 concentrations in stain space
+    C = np.clip(C, 0.0, None)
+
+    # Keep ONLY the target stain (collagen) and zero the others
+    c = C[..., channel]              # HxW
+    OD_only = c[..., None] * M[:, channel][None, None, :]   # back to OD RGB
+
+    # Recompose to RGB (I = I0 * exp(-OD))
+    I_rec = np.clip(float(I0) * np.exp(-OD_only), 0, 255).astype(np.uint8)
+    return I_rec
+
+# Optional: a direct collagen "concentration" map (no per-channel min/max inversion)
+def collagen_concentration(img_rgb_u8, M=None, channel=2):
+    """
+    Returns the raw collagen concentration (OD-space, non-negative float32).
+    Useful for thresholding fibrosis directly without the per-slide min–max used in masson_channels().
+    """
+    import numpy as np
+    if M is None:
+        M = _MASSON
+    M = M.astype(np.float32)
+    M = M / np.linalg.norm(M, axis=0, keepdims=True)
+
+    img = np.maximum(img_rgb_u8.astype(np.float32), 1.0)
+    OD  = -np.log(img / 255.0)
+
+    Minv = np.linalg.pinv(M)
+    C = OD @ Minv
+    return np.clip(C[..., channel], 0.0, None)  # collagen concentration (higher = more collagen)
+
+# Optional: fibrosis mask from collagen concentration (no RGB hacks)
+def fibrosis_mask_from_collagen(img_rgb_u8):
+    """
+    Makes a fibrosis mask by thresholding the collagen concentration map (OD units).
+    Avoids the min-max normalization of masson_channels().
+    """
+    import numpy as np
+    from skimage.filters import threshold_yen, threshold_otsu
+    from skimage import morphology
+
+    col = collagen_concentration(img_rgb_u8)    # float32
+    # Robust threshold (Yen), with Otsu fallback
+    try:
+        t = threshold_yen(col)
+    except Exception:
+        t = threshold_otsu(col)
+    m = col >= t
+    m = morphology.remove_small_objects(m, min_size=50)
+    return m
+
+def process_slide(mask_path):
+    slide_stem = os.path.splitext(os.path.basename(mask_path))[0]
+    T = StageTimer()
+
+    try:
+        # I/O
+        hb(slide_stem, "io", "start"); T.tic("io")
+        wsi_path = find_wsi_for_mask(mask_path)
+        if wsi_path is None:
+            T.toc("io"); hb(slide_stem, "io", "done")
+            return (pd.DataFrame(), pd.DataFrame(), pd.DataFrame(),
+                    None, None, None, T.as_rows(slide_stem))
+        img = read_rgb_u8(wsi_path)
+        lab = read_idx_mask(mask_path)
+        mpp_um = get_mpp_um(wsi_path)
+        T.toc("io"); hb(slide_stem, "io", "done")
+
+        # Deconvolution
+        need_deconv = (lab == GLOM_ID).any() or (lab == PT_ID).any() or (lab == DT_ID).any()
+        bs_mask = tuft_mask = fib_mask = None
+        if need_deconv:
+            hb(slide_stem, "deconv", "start"); T.tic("deconv")
+            bs_mask, tuft_mask, fib_mask = compute_subcompartment_masks(img)
+            T.toc("deconv"); hb(slide_stem, "deconv", "done")
+
+        # Glomeruli
+        hb(slide_stem, "glom_split", "start"); T.tic("glom_split")
+        glom_lab = measure.label((lab == GLOM_ID).astype(np.uint8) > 0).astype(np.int32)
+        T.toc("glom_split"); hb(slide_stem, "glom_split", "done")
+
+        hb(slide_stem, "glom_feats", "start"); T.tic("glom_feats")
+        glom_df = props_table_from_labels(
+            glom_lab, img, "Glom", slide_stem, mpp_um,
+            extra_masks=({"BowmanSpace": bs_mask, "Tuft": tuft_mask, "Fibrosis": fib_mask} if (lab == GLOM_ID).any() else None)
+        )
+        if not glom_df.empty:
+            glom_df["CorpuscleArea_px"]  = glom_df["Area_px"]
+            glom_df["CorpuscleArea_µm²"] = glom_df["Area_µm²"]
+        glom_df, glom_counts = glom_filter(glom_df)
+        T.toc("glom_feats"); hb(slide_stem, "glom_feats", "done")
+
+        # PT / DT split → keep top-N
+        hb(slide_stem, "pt_split", "start"); T.tic("pt_split")
+        pt_full = split_tubules_smart(img, (lab == PT_ID).astype(np.uint8),
+                                      class_name="PT",
+                                      min_area=PT_MIN_AREA_PX,
+                                      bridge_break=2,
+                                      lumen_pct_pt=70,
+                                      peak_rel_pt=0.50)
+        pt_lab  = keep_top_n_labels(pt_full, PT_TOPN)
+        T.toc("pt_split"); hb(slide_stem, "pt_split", "done")
+
+        hb(slide_stem, "dt_split", "start"); T.tic("dt_split")
+        dt_full = split_tubules_smart(img, (lab == DT_ID).astype(np.uint8),
+                                      class_name="DT",
+                                      min_area=DT_MIN_AREA_PX,
+                                      bridge_break=2,
+                                      lumen_pct_dt=80,
+                                      peak_rel_dt=0.55)
+        dt_lab  = keep_top_n_labels(dt_full, DT_TOPN)
+        T.toc("dt_split"); hb(slide_stem, "dt_split", "done")
+
+        # Optional refinement
+        if REFINE_TOP_PCT > 0:
+            hb(slide_stem, "pt_refine", "start"); T.tic("pt_refine")
+            pt_lab = refine_instances_on_crops(img, pt_lab, "PT")
+            T.toc("pt_refine"); hb(slide_stem, "pt_refine", "done")
+
+            hb(slide_stem, "dt_refine", "start"); T.tic("dt_refine")
+            dt_lab = refine_instances_on_crops(img, dt_lab, "DT")
+            T.toc("dt_refine"); hb(slide_stem, "dt_refine", "done")
+
+        # Features
+        hb(slide_stem, "pt_feats", "start"); T.tic("pt_feats")
+        pt_df = props_table_from_labels(
+            pt_lab, img, "PT", slide_stem, mpp_um,
+            extra_masks=({"Fibrosis": fib_mask} if (lab == PT_ID).any() and fib_mask is not None else None)
+        )
+        pt_df, pt_counts = tubule_filter(pt_df, "PT")
+        pt_df = attach_cell_lumen_nuclei_features(pt_df, pt_lab, img, mpp_um, class_name="PT")
+        T.toc("pt_feats"); hb(slide_stem, "pt_feats", "done")
+
+        hb(slide_stem, "dt_feats", "start"); T.tic("dt_feats")
+        dt_df = props_table_from_labels(
+            dt_lab, img, "DT", slide_stem, mpp_um,
+            extra_masks=({"Fibrosis": fib_mask} if (lab == DT_ID).any() and fib_mask is not None else None)
+        )
+        dt_df, dt_counts = tubule_filter(dt_df, "DT")
+        dt_df = attach_cell_lumen_nuclei_features(dt_df, dt_lab, img, mpp_um, class_name="DT")
+        T.toc("dt_feats"); hb(slide_stem, "dt_feats", "done")
+
+        # QC visuals
+        save_qc_visuals(slide_stem, img, glom_lab, pt_lab, dt_lab)
+
+        # Summaries
+        gsum = summary_row(glom_counts, "Glom", slide_stem)
+        psum = summary_row(pt_counts,   "PT",   slide_stem)
+        dsum = summary_row(dt_counts,   "DT",   slide_stem)
+
+        return glom_df, pt_df, dt_df, gsum, psum, dsum, T.as_rows(slide_stem)
+
+    except Exception as e:
+        if DEBUG:
+            err_row = pd.DataFrame([{"Slide": slide_stem, "Class":"__ERROR__", "Error": repr(e)}])
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, None, err_row, T.as_rows(slide_stem)
+        else:
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), None, None, None, T.as_rows(slide_stem)
+
+
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from tqdm.auto import tqdm
+import time, os
+from statistics import median
+from datetime import datetime, timezone
+
+mask_files = find_masks(MASK_DIR, MASK_PATTERNS)
+print(f"Found {len(mask_files)} mask files")
+
+glom_all, pt_all, dt_all = [], [], []
+sum_rows, timing_rows = [], []
+
+PER_SLIDE_TIMEOUT_S = 900
+print(f"Running with {THREAD_WORKERS} threads, per-slide timeout {PER_SLIDE_TIMEOUT_S}s")
+
+start_times = {}
+with ThreadPoolExecutor(max_workers=THREAD_WORKERS) as ex:
+    futs = []
+    fut_to_name = {}
+    for p in mask_files:
+        f = ex.submit(process_slide, p)
+        futs.append(f)
+        name = os.path.splitext(os.path.basename(p))[0]
+        fut_to_name[f] = name
+        start_times[f] = time.perf_counter()
+
+    ok=fail=0
+    pbar = tqdm(total=len(futs), desc="Slides", unit="slide", leave=True)
+
+    for fut in as_completed(futs):
+        slide = fut_to_name.get(fut, "__UNKNOWN__")
+        try:
+            gdf, pdf, ddf, gsum, psum, dsum, trows = fut.result(timeout=PER_SLIDE_TIMEOUT_S)
+
+            if gdf is not None and not gdf.empty: glom_all.append(gdf)
+            if pdf is not None and not pdf.empty: pt_all.append(pdf)
+            if ddf is not None and not ddf.empty: dt_all.append(ddf)
+            for r in (gsum, psum, dsum):
+                if r is not None: sum_rows.append(r)
+            if trows: timing_rows.extend(trows)
+
+            total_sec = None
+            if trows:
+                for row in trows:
+                    if row.get("Stage") == "__TOTAL__":
+                        total_sec = row.get("Seconds", None); break
+
+            gk = len(gdf) if gdf is not None else 0
+            pk = len(pdf) if pdf is not None else 0
+            dk = len(ddf) if ddf is not None else 0
+            if total_sec is not None:
+                tqdm.write(f"[OK] {slide}: Glom={gk}, PT={pk}, DT={dk}, time={total_sec:.1f}s")
+            else:
+                tqdm.write(f"[OK] {slide}: Glom={gk}, PT={pk}, DT={dk}")
+
+            ok += 1
+
+        except TimeoutError:
+            fail += 1
+            tqdm.write(f"[TIMEOUT] {slide} > {PER_SLIDE_TIMEOUT_S}s")
+            if DEBUG:
+                timing_rows.append({"Slide": slide, "Stage": "__EXCEPTION__", "Seconds": 0.0, "Note": "Timeout"})
+
+        except Exception as e:
+            fail += 1
+            tqdm.write(f"[ERROR] {slide}: {repr(e)}")
+            if DEBUG:
+                timing_rows.append({"Slide": slide, "Stage": "__EXCEPTION__", "Seconds": 0.0, "Note": repr(e)})
+
+        pbar.update(1)
+        start_times.pop(fut, None)
+
+        now = time.perf_counter()
+        inflight_elapsed = [now - t0 for t0 in start_times.values()]
+        oldest = max(inflight_elapsed) if inflight_elapsed else 0.0
+        med    = median(inflight_elapsed) if inflight_elapsed else 0.0
+        pbar.set_postfix(ok=ok, fail=fail, queued=len(start_times), oldest=f"{oldest:5.1f}s", median=f"{med:5.1f}s")
+
+    pbar.close()
+
+print(f"Completed {ok+fail}/{len(mask_files)} slides (ok={ok}, fail={fail})")
+
+# Write per-instance CSVs
+if glom_all:
+    pd.concat(glom_all, ignore_index=True).to_csv(os.path.join(CSV_DIR, "glomeruli_instances.csv"), index=False)
+if pt_all:
+    pd.concat(pt_all,   ignore_index=True).to_csv(os.path.join(CSV_DIR, "pt_instances.csv"), index=False)
+if dt_all:
+    pd.concat(dt_all,   ignore_index=True).to_csv(os.path.join(CSV_DIR, "dt_instances.csv"), index=False)
+
+# Summary counts
+if sum_rows:
+    summary = pd.concat(sum_rows, ignore_index=True)
+    summary.to_csv(os.path.join(CSV_DIR, "summary_qc_counts.csv"), index=False)
+
+# Stage timings
+if timing_rows:
+    timings_df = pd.DataFrame(timing_rows)
+    timings_path = os.path.join(CSV_DIR, "debug_stage_timings.csv")
+    timings_df.to_csv(timings_path, index=False)
+    agg = timings_df.groupby("Stage")["Seconds"].mean().sort_values(ascending=False)
+    print("\nMean seconds per stage:")
+    print(agg)
+
+print("Done.")
+print("Per-instance CSVs ->", CSV_DIR)
+print("QC overlays       ->", QC_DIR)
+print("Debug heartbeats  ->", os.path.join(QC_DIR, "_debug"))
+print("Stage timings     ->", os.path.join(CSV_DIR, "debug_stage_timings.csv"))

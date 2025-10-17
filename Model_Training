@@ -1,4 +1,4 @@
-# Model Training File
+# Model Training File for Google Colab
 
 from google.colab import drive
 drive.mount('/content/drive')
